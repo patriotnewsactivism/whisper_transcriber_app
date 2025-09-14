@@ -14,13 +14,19 @@ export default function App() {
   const [opts, setOpts] = useState({ model:'large-v3', device:'cuda', compute_type:'float16', language:'en' })
   const wsRef = useRef(null)
 
-  async function start() {
-    if (!file) { setLog(p=>[...p, 'Pick a file first']); return }
-    setTranscript('') // reset
+ async function submit(file) {
+  const fd = new FormData()
+  fd.append("file", file)
+  // OpenAI params:
+  fd.append("model", "gpt-4o-mini-transcribe") // Whisper-optimized model
+  // Optional: language hint for English-only audio
+  // fd.append("language", "en")
 
-    const form = new FormData()
-    form.append('file', file)
-    Object.entries(opts).forEach(([k,v]) => form.append(k, v))
+  const res = await fetch("/api/transcribe", { method: "POST", body: fd })
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  const data = await res.json() // { text: "..." }
+  setTranscript(data.text || "")
+}
 
     setStatus('uploading')
     let job_id, fname

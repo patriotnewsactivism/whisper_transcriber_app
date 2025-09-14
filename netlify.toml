@@ -1,3 +1,8 @@
-[build]
-  command = "pip install -r server/requirements.txt && npm --prefix client ci && npm --prefix client run build"
-  publish = "client/dist"
+[functions]
+  node_bundler = "esbuild"
+  external_node_modules = []
+  included_files = []
+
+[[edge_functions]]
+  path = "/api/transcribe"
+  function = "transcribe"

@@ -31,7 +31,7 @@ export default function App() {
   const [text, setText] = useState('')
   const [segs, setSegs] = useState([])
 
-<<<<<<< HEAD
+  
  async function submit(file) {
   const fd = new FormData()
   fd.append("file", file)
@@ -45,7 +45,7 @@ export default function App() {
   const data = await res.json() // { text: "..." }
   setTranscript(data.text || "")
 }
-=======
+
   async function transcribe(){
     if (!file) return
     setStatus('loading model…'); setLog([]); setText(''); setSegs([])
@@ -54,7 +54,6 @@ export default function App() {
     const asr = await pipeline('automatic-speech-recognition', modelId, {
       quantized: true
     })
->>>>>>> 699e515f940bcf8ad8ef6926c3d4d57eb30d5e59
 
     setStatus('preparing audio…')
     const audio = await file.arrayBuffer()

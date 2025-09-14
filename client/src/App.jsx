@@ -1,139 +1,118 @@
-// client/src/App.jsx
-import React, { useState, useRef } from 'react'
+import React, { useState } from 'react'
+import { pipeline } from '@xenova/transformers'
 
-const API = import.meta.env.VITE_API_URL || 'http://localhost:8000'
-const wsUrl = (base) => base.replace(/^http/, 'ws')
+function toSRT(segs){
+  const fmt = t => {
+    const ms = Math.floor(t*1000), h=Math.floor(ms/3600000), m=Math.floor((ms%3600000)/60000), s=Math.floor((ms%60000)/1000), ms2=ms%1000
+    return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')},${String(ms2).padStart(3,'0')}`
+  }
+  return segs.map((s,i)=>`${i+1}\n${fmt(s.start)} --> ${fmt(s.end)}\n${s.text.trim()}\n`).join('\n')
+}
+function toVTT(segs){
+  const fmt = t => {
+    const ms = Math.floor(t*1000), h=Math.floor(ms/3600000), m=Math.floor((ms%3600000)/60000), s=Math.floor((ms%60000)/1000), ms2=ms%1000
+    return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}.${String(ms2).padStart(3,'0')}`
+  }
+  return 'WEBVTT\n\n' + segs.map(s=>`${fmt(s.start)} --> ${fmt(s.end)}\n${s.text.trim()}\n`).join('\n')
+}
+function download(name, text){
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url; a.download = name; a.click()
+  URL.revokeObjectURL(url)
+}
 
 export default function App() {
-  const [jobId, setJobId] = useState(null)
-  const [status, setStatus] = useState('idle')
-  const [filename, setFilename] = useState(null)
-  const [log, setLog] = useState([])
   const [file, setFile] = useState(null)
-  const [transcript, setTranscript] = useState('') // <- preview text
-  const [opts, setOpts] = useState({ model:'large-v3', device:'cuda', compute_type:'float16', language:'en' })
-  const wsRef = useRef(null)
+  const [status, setStatus] = useState('idle')
+  const [log, setLog] = useState([])
+  const [modelId, setModelId] = useState('Xenova/whisper-small.en') // free & light
+  const [text, setText] = useState('')
+  const [segs, setSegs] = useState([])
 
-  async function start() {
-    if (!file) { setLog(p=>[...p, 'Pick a file first']); return }
-    setTranscript('') // reset
+  async function transcribe(){
+    if (!file) return
+    setStatus('loading model…'); setLog([]); setText(''); setSegs([])
 
-    const form = new FormData()
-    form.append('file', file)
-    Object.entries(opts).forEach(([k,v]) => form.append(k, v))
+    // Load once; it will cache in the browser
+    const asr = await pipeline('automatic-speech-recognition', modelId, {
+      quantized: true
+    })
 
-    setStatus('uploading')
-    let job_id, fname
-    try {
-      const res = await fetch(`${API}/jobs`, { method: 'POST', body: form })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const js = await res.json()
-      job_id = js.job_id; fname = js.filename
-    } catch (e) {
-      setStatus('error'); setLog(p=>[...p, `create_job failed: ${e}`]); return
-    }
-    setJobId(job_id); setFilename(fname); setStatus('queued')
+    setStatus('preparing audio…')
+    const audio = await file.arrayBuffer()
 
-    // progress via WS
-    const ws = new WebSocket(`${wsUrl(API)}/ws/jobs/${job_id}`)
-    ws.onmessage = (e)=> setLog(p=>[...p, e.data])
-    ws.onerror = ()=> setLog(p=>[...p, 'websocket error'])
-    wsRef.current = ws
-
-    // poll status
-    const t = setInterval(async ()=>{
-      try {
-        const s = await fetch(`${API}/jobs/${job_id}`).then(r=>r.json())
-        setStatus(s.state || 'unknown')
-        if (s.state === 'done') {
-          clearInterval(t)
-          // auto fetch preview text
-          try {
-            const txt = await fetchResult('txt', true)
-            setTranscript(txt)
-          } catch {}
+    setStatus('transcribing…')
+    const out = await asr(audio, {
+      // chunking makes long files work reliably
+      chunk_length_s: 30,
+      stride_length_s: 5,
+      return_timestamps: true,
+      callback_function: (x) => {
+        if (x?.chunks?.length) {
+          setLog(prev => [...prev, `chunks: ${x.chunks.length}`])
         }
-        if (s.state === 'error') clearInterval(t)
-      } catch (e) {
-        setLog(p=>[...p, `poll failed: ${e}`])
       }
-    }, 1000)
+    })
+
+    // out has either .text or .chunks with timestamps
+    const chunks = out.chunks?.map(c => ({
+      start: c.timestamp[0] ?? 0,
+      end:   c.timestamp[1] ?? 0,
+      text:  c.text || ''
+    })) || []
+
+    setText(out.text || chunks.map(c=>c.text).join(' '))
+    setSegs(chunks)
+    setStatus('done')
   }
 
-  // Fetch result and optionally download it
-  async function fetchResult(ext, returnText = false) {
-    if (!jobId || !filename) return ''
-    const url = `${API}/jobs/${jobId}/result?filename=${encodeURIComponent(filename)}&ext=${ext}`
-    const res = await fetch(url)
-    if (!res.ok) throw new Error(`result ${ext} not ready`)
-    const blob = await res.blob()
-    if (returnText) {
-      if (ext === 'txt' || ext === 'vtt' || ext === 'srt') {
-        return await blob.text()
-      }
-      return ''
-    }
-    // trigger browser download
-    const a = document.createElement('a')
-    a.href = URL.createObjectURL(blob)
-    a.download = `${filename.replace(/\.[^/.]+$/, '')}.${ext}`
-    document.body.appendChild(a); a.click(); a.remove()
-    URL.revokeObjectURL(a.href)
-    return ''
-  }
-
-  async function copyTranscript() {
-    if (!transcript) return
-    await navigator.clipboard.writeText(transcript)
-    setLog(p=>[...p, 'copied transcript to clipboard'])
-  }
+  const baseName = file ? file.name.replace(/\.[^/.]+$/, '') : 'transcript'
+  const srt = segs.length ? toSRT(segs) : ''
+  const vtt = segs.length ? toVTT(segs) : ''
 
   return (
     <div style={{maxWidth:900, margin:'40px auto', fontFamily:'system-ui'}}>
-      <h1>Whisper Transcriber</h1>
+      <h1>Whisper (Browser-only, free)</h1>
 
-      <div style={{display:'grid', gap:12, gridTemplateColumns:'repeat(4, 1fr)'}}>
-        <div><label>Model</label><select value={opts.model} onChange={e=>setOpts({...opts, model:e.target.value})}>
-          <option>large-v3</option><option>large-v2</option><option>medium.en</option></select></div>
-        <div><label>Device</label><select value={opts.device} onChange={e=>setOpts({...opts, device:e.target.value})}>
-          <option>cuda</option><option>cpu</option></select></div>
-        <div><label>Compute</label><select value={opts.compute_type} onChange={e=>setOpts({...opts, compute_type:e.target.value})}>
-          <option>float16</option><option>int8_float16</option><option>int8</option></select></div>
-        <div><label>Language</label><select value={opts.language} onChange={e=>setOpts({...opts, language:e.target.value})}>
-          <option>en</option></select></div>
+      <div style={{display:'grid', gap:12, gridTemplateColumns:'2fr 2fr 1fr'}}>
+        <div>
+          <label>Model</label>
+          <select value={modelId} onChange={e=>setModelId(e.target.value)} style={{display:'block', width:'100%'}}>
+            <option value="Xenova/whisper-small.en">whisper-small.en (fast/accurate)</option>
+            <option value="Xenova/whisper-base.en">whisper-base.en (fastest)</option>
+            <option value="Xenova/whisper-medium.en">whisper-medium.en (better, slower)</option>
+          </select>
+        </div>
+        <div>
+          <label>File</label>
+          <input type="file" accept="audio/*,video/*"
+                 onChange={e=>setFile(e.target.files?.[0] || null)}
+                 style={{display:'block', width:'100%'}} />
+        </div>
+        <div style={{alignSelf:'end'}}>
+          <button onClick={transcribe} disabled={!file || status==='loading model…'}>Submit</button>
+        </div>
       </div>
 
-      <div style={{marginTop:16, padding:16, border:'1px dashed #999'}}>
-        <input type="file" accept="audio/*,video/*" onChange={e=>setFile(e.target.files?.[0])}/>
-        <button style={{marginLeft:12}} onClick={start}>Submit</button>
-        <div style={{marginTop:8}}>Status: <b>{status}</b></div>
-      </div>
-
-      <pre style={{marginTop:16, background:'#111', color:'#b2f5ea', padding:12, height:160, overflow:'auto'}}>
+      <div style={{marginTop:8}}>Status: <b>{status}</b></div>
+      <pre style={{marginTop:8, background:'#111', color:'#b2f5ea', padding:12, height:120, overflow:'auto'}}>
         {log.map((l,i)=><div key={i}>{l}</div>)}
       </pre>
 
-      {/* Preview + Downloads */}
       {status==='done' && (
         <div style={{marginTop:16}}>
           <div style={{display:'flex', gap:12, flexWrap:'wrap', marginBottom:8}}>
-            <button onClick={()=>fetchResult('txt')}>Download .txt</button>
-            <button onClick={()=>fetchResult('srt')}>Download .srt</button>
-            <button onClick={()=>fetchResult('vtt')}>Download .vtt</button>
-            <button onClick={copyTranscript} disabled={!transcript}>Copy to Clipboard</button>
+            <button onClick={()=>download(`${baseName}.txt`, text)}>Download .txt</button>
+            <button onClick={()=>download(`${baseName}.srt`, srt)} disabled={!srt}>Download .srt</button>
+            <button onClick={()=>download(`${baseName}.vtt`, vtt)} disabled={!vtt}>Download .vtt</button>
+            <button onClick={async()=>{await navigator.clipboard.writeText(text)}}>Copy</button>
           </div>
-
           <h3>Transcript preview</h3>
-          <textarea
-            value={transcript}
-            readOnly
-            style={{width:'100%', minHeight:240, padding:10, fontFamily:'ui-monospace, Menlo, Consolas'}}
-            placeholder="Transcript preview will appear here once ready."
-          />
+          <textarea value={text} readOnly style={{width:'100%', minHeight:260, padding:10, fontFamily:'ui-monospace'}}/>
         </div>
       )}
-
-      {status==='error' && <div style={{color:'crimson'}}>Job failed. Check logs above.</div>}
     </div>
   )
 }

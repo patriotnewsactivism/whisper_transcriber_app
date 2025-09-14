@@ -1,11 +1,10 @@
-
 from __future__ import annotations
-import uuid, asyncio, subprocess
+import os, uuid, asyncio, subprocess
 from pathlib import Path
 from typing import Dict, List
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from concurrent.futures import ThreadPoolExecutor
 
 from faster_whisper import WhisperModel
@@ -14,10 +13,11 @@ APP_DIR = Path(__file__).parent
 JOBS_DIR = APP_DIR / "jobs"
 JOBS_DIR.mkdir(exist_ok=True)
 
+# simple in-process caches/state
 MODEL_CACHE: Dict[tuple, WhisperModel] = {}
-EXEC = ThreadPoolExecutor(max_workers=1)
 JOB_STATUS: Dict[str, dict] = {}
 CLIENTS: Dict[str, List[WebSocket]] = {}
+EXEC = ThreadPoolExecutor(max_workers=1)
 
 def get_model(name: str, device: str, compute_type: str) -> WhisperModel:
     key = (name, device, compute_type)
@@ -26,6 +26,7 @@ def get_model(name: str, device: str, compute_type: str) -> WhisperModel:
     return MODEL_CACHE[key]
 
 def ffmpeg_clean(inp: Path, out_wav: Path):
+    # convert to mono 16k wav for stable ASR
     cmd = ["ffmpeg", "-y", "-i", str(inp), "-ac", "1", "-ar", "16000", str(out_wav)]
     subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -51,7 +52,7 @@ def to_srt(segs):
         lines.append(str(i))
         lines.append(f"{fmt(s['start'])} --> {fmt(s['end'])}")
         lines.append(s["text"]); lines.append("")
-    return "\\n".join(lines)
+    return "\n".join(lines)
 
 def to_vtt(segs):
     def fmt(t):
@@ -61,23 +62,26 @@ def to_vtt(segs):
     for s in segs:
         out.append(f"{fmt(s['start'])} --> {fmt(s['end'])}")
         out.append(s["text"]); out.append("")
-    return "\\n".join(out)
+    return "\n".join(out)
 
 app = FastAPI(title="Whisper Transcriber")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # open for dev; lock down later if you want
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+@app.get("/health")
+def health(): return {"ok": True}
+
 @app.post("/jobs")
 async def create_job(
     file: UploadFile = File(...),
     model: str = Form("large-v3"),
-    device: str = Form("cuda"),
-    compute_type: str = Form("float16"),
+    device: str = Form("cuda"),            # use "cpu" if no GPU/cudnn
+    compute_type: str = Form("float16"),   # try "int8_float16" if VRAM is tight
     language: str = Form("en"),
 ):
     jid = str(uuid.uuid4())
@@ -87,16 +91,15 @@ async def create_job(
     raw_path = jdir/"input"/file.filename
     with open(raw_path, "wb") as f:
         f.write(await file.read())
+
     JOB_STATUS[jid] = {"state": "queued", "msg": "", "filename": file.filename}
 
     async def run():
         def log(m):
             JOB_STATUS[jid]["msg"] = m
             for ws in CLIENTS.get(jid, []):
-                try:
-                    asyncio.create_task(ws.send_text(m))
-                except:
-                    pass
+                try: asyncio.create_task(ws.send_text(m))
+                except: pass
 
         def work():
             try:
@@ -104,6 +107,7 @@ async def create_job(
                 wav = jdir/"input"/(raw_path.stem + ".wav")
                 ffmpeg_clean(raw_path, wav)
 
+                # VRAM-friendly retry strategy
                 try_order = [
                     (model, device, compute_type),
                     (model, device, "int8_float16"),
@@ -120,7 +124,7 @@ async def create_job(
                         segs = transcribe_segments(mdl, wav, language)
                         stem = raw_path.stem
                         (jdir/"out"/f"{stem}.txt").write_text(
-                            "\\n".join(s["text"] for s in segs), encoding="utf-8")
+                            "\n".join(s["text"] for s in segs), encoding="utf-8")
                         (jdir/"out"/f"{stem}.srt").write_text(to_srt(segs), encoding="utf-8")
                         (jdir/"out"/f"{stem}.vtt").write_text(to_vtt(segs), encoding="utf-8")
                         JOB_STATUS[jid]["state"] = "done"
